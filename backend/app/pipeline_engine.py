@@ -124,7 +124,11 @@ class PipelineEngine:
         }
 
     def run_cdc_upsert_simulation(self, cdc_id: int) -> dict[str, Any]:
-        """模拟CDC捕获后的增量合并：产生合并结果记录。"""
+        """模拟CDC捕获后的增量合并：按分批键索引生成合并批次结果。
+
+        接入合并批次引擎：每个批次只处理自己负责的键范围，合并批次结果保留
+        批次键范围与待重算集合，并交付给 CDC 捕获核对增量来源。
+        """
         cdc = store.find("change_capture", cdc_id)
         if not cdc:
             return {"ok": False, "error": f"CDC配置 {cdc_id} 不存在"}
@@ -135,18 +139,41 @@ class PipelineEngine:
             return {"ok": False, "error": f"源表 {source_table} 未配置合并策略"}
 
         merge_key = upsert.get("合并键列", "id")
-        # 模拟产生合并产物
+
+        # 走新的合并批次链路：规划 -> 逐批发布 -> CDC 交接
+        from app.services.data_scope import SCOPE_TABLES
+        from app.services.merge_batch import merge_batch_service
+
+        scope = next((s for s, table in SCOPE_TABLES.items() if table == source_table), "orders")
+        run, plan_msg = merge_batch_service.plan_run(
+            scope,
+            upsert_id=int(upsert["id"]),
+            key_count=9,
+            batch_size=3,
+            cdc_config_id=cdc_id,
+        )
+        if run is None:
+            return {"ok": False, "error": plan_msg}
+
+        run_id = int(run["id"])
+        batches = merge_batch_service.list_batches(scope, run_id)
+        for batch in batches:
+            merge_batch_service.run_batch(scope, run_id, int(batch["batch_no"]))
+        handoff, handoff_msg = merge_batch_service.handoff_to_cdc(scope, run_id, cdc_id)
+
+        # 保留旧的合并产物结构，兼容既有消费方与测试断言
         merged_records = []
-        for i in range(3):
+        operations = ["INSERT", "UPDATE", "DELETE"]
+        for idx in range(1, 10):
             merged_records.append({
-                "merge_key": f"{merge_key}-{(i+1):04d}",
-                "operation": ["INSERT", "UPDATE", "DELETE"][i % 3],
+                "merge_key": f"{merge_key}-{idx:04d}",
+                "operation": operations[(idx - 1) % 3],
                 "source_table": source_table,
                 "cdc_config_id": cdc_id,
+                "run_id": run_id,
                 "merged_at": datetime.now().isoformat(),
             })
 
-        # 写入upsert_merge模块的附属产物表
         self._ensure_artifact_table("upsert_merge_artifacts")
         for rec in merged_records:
             store.rows("upsert_merge_artifacts").append(rec)
@@ -158,6 +185,13 @@ class PipelineEngine:
             "merge_key": merge_key,
             "merged_count": len(merged_records),
             "artifacts": merged_records,
+            "run_id": run_id,
+            "batch_count": len(batches),
+            "batch_key_ranges": [
+                [b["key_range"]["lower_key"], b["key_range"]["upper_key"]] for b in batches
+            ],
+            "handoff": handoff,
+            "handoff_message": handoff_msg,
         }
 
     def apply_partition_to_iceberg(self, table_name: str) -> dict[str, Any]:
@@ -586,6 +620,11 @@ class PipelineEngine:
             "compact_results": len(store.rows("compact_results")),
             "ttl_applied_log": len(store.rows("ttl_applied_log")),
             "realtime_metric_results": len(store.rows("realtime_metric_results")),
+            "merge_batch_runs": len(store.rows("merge_batch_runs")),
+            "merge_batch_results": len(store.rows("merge_batch_results")),
+            "merge_order_records": len(store.rows("merge_order_records")),
+            "merge_cdc_handoffs": len(store.rows("merge_cdc_handoffs")),
+            "cdc_handoff_confirmations": len(store.rows("cdc_handoff_confirmations")),
         }
 
         return {

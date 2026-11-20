@@ -474,12 +474,15 @@ function parseCsv(text: string): string[][] {
   return records
 }
 
-test('CRUD模块：筛选、导出、登记、动作、指标全链路', async ({ page }) => {
+test('CRUD模块：筛选、导出、登记、动作、指标全链路', async ({ page, request }) => {
   test.setTimeout(300_000)
   const browserErrors: string[] = []
   page.on('pageerror', e => browserErrors.push(e.message))
   page.on('response', r => { if (r.url().includes('/api/') && r.status()>=400) browserErrors.push(`${r.status()} ${r.url()}`) })
   if (crudModules.length === 0) { test.skip(); return }
+  // 从干净种子状态开始，避免其他用例累积的数据影响初始行数断言
+  const resetResp = await request.post('/api/testing/reset')
+  expect(resetResp.ok()).toBeTruthy()
 
   for (const mod of crudModules) {
     await page.goto(`/${mod.key}`)
@@ -500,6 +503,15 @@ test('CRUD模块：筛选、导出、登记、动作、指标全链路', async (
     expect(download.suggestedFilename()).toBe(`${mod.key}.csv`)
 
     const createdValues = mod.fields.map((f, i) => `验收-${mod.key}-${i+1}`)
+    // 流式质量的「监控主题」有跨模块引用校验，必须填已注册主题 TOPI-0001，
+    // 否则后端会以“监控主题未注册”拒绝创建（其余字段仍使用唯一的验收值）。
+    if (mod.key === 'stream_quality') {
+      const topicIndex = mod.fields.indexOf('监控主题')
+      if (topicIndex >= 0) createdValues[topicIndex] = 'TOPI-0001'
+      // 阈值设为 9999，避免「标记生效」联动生成死信而干扰后续死信模块的初始行数
+      const thresholdIndex = mod.fields.indexOf('告警阈值')
+      if (thresholdIndex >= 0) createdValues[thresholdIndex] = '9999'
+    }
     await page.getByTestId('open-create').click()
     await expect(page.getByTestId('create-modal')).toBeVisible()
     for (const [i, field] of mod.fields.entries()) {

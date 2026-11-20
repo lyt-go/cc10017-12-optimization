@@ -6,6 +6,7 @@ const FlinkJob = () => import('@/views/flink_job/index.vue')
 const KafkaConnector = () => import('@/views/kafka_connector/index.vue')
 const SchemaEvolve = () => import('@/views/schema_evolve/index.vue')
 const UpsertMerge = () => import('@/views/upsert_merge/index.vue')
+const MergeBatch = () => import('@/views/merge_batch/index.vue')
 const LakePartition = () => import('@/views/lake_partition/index.vue')
 const StreamQuality = () => import('@/views/stream_quality/index.vue')
 const IcebergTable = () => import('@/views/iceberg_table/index.vue')
@@ -29,6 +30,7 @@ const router = createRouter({
     { path: '/kafka_connector', name: 'kafka_connector', component: KafkaConnector },
     { path: '/schema_evolve', name: 'schema_evolve', component: SchemaEvolve },
     { path: '/upsert_merge', name: 'upsert_merge', component: UpsertMerge },
+    { path: '/merge_batch', name: 'merge_batch', component: MergeBatch },
     { path: '/lake_partition', name: 'lake_partition', component: LakePartition },
     { path: '/stream_quality', name: 'stream_quality', component: StreamQuality },
     { path: '/iceberg_table', name: 'iceberg_table', component: IcebergTable },

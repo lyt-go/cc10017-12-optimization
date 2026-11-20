@@ -10,6 +10,8 @@ from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload
 from app.services.change_capture import ChangeCaptureService
+from app.services.data_scope import DataScopeError, resolve_scope
+from app.services.merge_batch import merge_batch_service
 
 router = APIRouter(prefix="/api/change_capture", tags=["CDC捕获"])
 service = ChangeCaptureService()
@@ -46,6 +48,17 @@ def export_entries() -> StreamingResponse:
                              headers={"Content-Disposition": "attachment; filename=change_capture.csv"})
 
 
+@router.get("/handoffs")
+def list_handoffs(request: Request) -> dict[str, Any]:
+    """CDC 侧只读查看增量合并交付过来的合并批次交接结果。
+
+    必须声明在 /{entry_id} 之前，否则 handoffs 会被当成 entry_id 匹配而校验失败。
+    """
+    scope = resolve_scope(request)
+    items = merge_batch_service.list_handoffs(scope)
+    return {"items": items, "total": len(items), "readonly": True, "scope": scope}
+
+
 @router.get("/{entry_id}")
 def get_entry(entry_id: int) -> dict:
     entry = service.get_entry(entry_id)
@@ -68,3 +81,26 @@ def run_action(entry_id: int, payload: ActionPayload) -> ActionResult:
     if entry_or_none is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry_or_none)
+
+
+@router.post("/{entry_id}/confirm-handoff/{run_id}")
+def confirm_handoff(request: Request, entry_id: int, run_id: int) -> ActionResult:
+    """CDC 捕获核对本批键范围对应的增量来源（共享内容只读）。"""
+    try:
+        confirmation, message = service.confirm_merge_handoff(
+            resolve_scope(request), entry_id, run_id)
+        if confirmation is None:
+            return ActionResult(ok=False, message=message)
+        return ActionResult(ok=True, message=message, entry=confirmation)
+    except DataScopeError as exc:
+        return ActionResult(ok=False, message=str(exc))
+
+
+@router.get("/{entry_id}/handoff-confirmations")
+def list_confirmations(request: Request, entry_id: int) -> dict[str, Any]:
+    """CDC 对合并批次来源的核对记录。"""
+    try:
+        items = service.list_handoff_confirmations(resolve_scope(request), entry_id)
+        return {"items": items, "total": len(items)}
+    except DataScopeError as exc:
+        return {"items": [], "total": 0, "ok": False, "error": str(exc)}

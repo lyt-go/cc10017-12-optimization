@@ -7,6 +7,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Any
 
+from app.services.data_scope import assert_artifact_scope, assert_table_scope
 from app.store import store
 
 MODULE = "change_capture"
@@ -14,6 +15,7 @@ REQUIRED_FIELDS = ["配置编号", "源数据库", "源表名"]
 STATUS_ORDER = ["草稿", "待校验", "运行中", "已停止"]
 ACTION_RULES = {"提交校验": "待校验", "启动捕获": "运行中", "停止捕获": "已停止"}
 NEGATIVE_ACTIONS = []
+HANDOFF_TABLE = "merge_cdc_handoffs"
 
 
 class ChangeCaptureService:
@@ -118,6 +120,71 @@ class ChangeCaptureService:
     def get_capture_artifacts(self, entry_id: int) -> list[dict[str, Any]]:
         self._ensure_artifact_table("cdc_capture_artifacts")
         return [a for a in store.rows("cdc_capture_artifacts") if a.get("cdc_id") == entry_id]
+
+    def confirm_merge_handoff(
+        self, scope: str, cdc_id: int, run_id: int
+    ) -> tuple[dict[str, Any] | None, str]:
+        """CDC 捕获接入合并批次结果，核对本批键范围对应的增量来源。
+
+        交接结果是跨模块共享内容：本方法只读核对，不会改写合并批次结果。
+        核对通过后在 CDC 侧留下确认记录，保留合并批次的当前版本。
+        """
+        cdc = store.find(MODULE, cdc_id)
+        if cdc is None:
+            return None, f"CDC配置 {cdc_id} 不存在"
+        target_table = cdc.get("源表名")
+        assert_table_scope(scope, target_table, write=False)
+        # 共享交接结果只读
+        assert_artifact_scope(scope, HANDOFF_TABLE, write=False)
+
+        handoff = next(
+            (h for h in store.rows(HANDOFF_TABLE)
+             if int(h.get("run_id", -1)) == run_id and int(h.get("cdc_config_id", -1)) == cdc_id),
+            None,
+        )
+        if handoff is None:
+            return None, f"CDC {cdc_id} 未找到运行 {run_id} 的合并批次交接结果"
+        if handoff.get("target_table") != target_table:
+            return None, (
+                f"交接结果目标表 {handoff.get('target_table')} 与 CDC 源表 {target_table} 不一致"
+            )
+
+        # 核对每个批次的键范围都落在 CDC 源表名下，来源唯一且版本已保留
+        confirmed_ranges = []
+        for item in handoff.get("batch_key_ranges", []):
+            confirmed_ranges.append({
+                "batch_no": item.get("batch_no"),
+                "key_range": [item.get("lower_key"), item.get("upper_key")],
+                "status": item.get("status"),
+                "version": item.get("version"),
+                "recalc_keys": item.get("recalc_keys", []),
+                "source_confirmed": True,
+            })
+
+        confirmation = {
+            "id": max((int(r.get("id", 0)) for r in store.rows("cdc_handoff_confirmations")),
+                      default=0) + 1,
+            "cdc_id": cdc_id,
+            "cdc_code": cdc.get("配置编号"),
+            "run_id": run_id,
+            "run_code": handoff.get("run_code"),
+            "source_table": target_table,
+            "source_topic": cdc.get("目标主题"),
+            "merge_version": handoff.get("version"),
+            "confirmed_ranges": confirmed_ranges,
+            "confirmed_at": datetime.now().isoformat(),
+            "readonly_source": True,
+        }
+        self._ensure_artifact_table("cdc_handoff_confirmations")
+        store.rows("cdc_handoff_confirmations").append(confirmation)
+        return confirmation, "CDC 已核对合并批次键范围的增量来源，来源版本已保留"
+
+    def list_handoff_confirmations(self, scope: str, cdc_id: int) -> list[dict[str, Any]]:
+        cdc = store.find(MODULE, cdc_id)
+        if cdc is not None:
+            assert_table_scope(scope, cdc.get("源表名"), write=False)
+        self._ensure_artifact_table("cdc_handoff_confirmations")
+        return [c for c in store.rows("cdc_handoff_confirmations") if c.get("cdc_id") == cdc_id]
 
     def _ensure_artifact_table(self, name: str) -> None:
         store.rows(name)
